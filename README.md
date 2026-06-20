@@ -78,7 +78,7 @@ This platform solves all of these problems with AI.
 ![Dashboard](screenshots/02_dashboard.png)
 
 ### 🎤 Interview Screen
-![Interview Screen](screenshots/03_interview.png)
+![Interview Screen](Screenshots/03_interview.png)
 
 ### 📈 Results & Analytics
 ![Results Page](screenshots/04_results.png)
