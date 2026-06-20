@@ -14,7 +14,7 @@ Get instant feedback, performance analytics, and personalized improvement roadma
 
 ---
 
-![Home Page](screenshots/01_homepage.png)
+![Home Page](Screenshots/01_homepage.png)
 
 </div>
 
@@ -72,28 +72,28 @@ This platform solves all of these problems with AI.
 > Replace the placeholder images below with actual screenshots after capturing them.
 
 ### 🏠 Home Page
-![Home Page](screenshots/01_homepage.png)
+![Home Page](Screenshots/01_homepage.png)
 
 ### 📊 Dashboard
-![Dashboard](screenshots/02_dashboard.png)
+![Dashboard](Screenshots/02_dashboard.png)
 
 ### 🎤 Interview Screen
 ![Interview Screen](Screenshots/03_interview.png)
 
 ### 📈 Results & Analytics
-![Results Page](screenshots/04_results.png)
+![Results Page](Screenshots/04_results.png)
 
 ### 🎯 AI Feedback
-![Feedback](screenshots/05_feedback.png)
+![Feedback](Screenshots/05_feedback.png)
 
 ### 📄 PDF Report
-![PDF Report](screenshots/06_pdf_report.png)
+![PDF Report](Screenshots/06_pdf_report.png)
 
 ### 🛡️ Admin Panel
-![Admin Panel](screenshots/07_admin.png)
+![Admin Panel](Screenshots/07_admin.png)
 
 ### 📱 Mobile View
-![Mobile View](screenshots/08_mobile.png)
+![Mobile View](Screenshots/08_mobile.png)
 
 ---
 
