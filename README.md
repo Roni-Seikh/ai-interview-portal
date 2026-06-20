@@ -69,8 +69,6 @@ This platform solves all of these problems with AI.
 
 ## 📸 Screenshots
 
-> Replace the placeholder images below with actual screenshots after capturing them.
-
 ### 🏠 Home Page
 ![Home Page](Screenshots/01_homepage.png)
 
