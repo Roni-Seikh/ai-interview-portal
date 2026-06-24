@@ -1,6 +1,6 @@
 """
-Authentication Routes - Fixed email delivery for Render hosting
-Uses direct smtplib as fallback when Flask-Mail fails on Render
+Authentication Routes - Brevo SMTP version
+Clean implementation, no complex fallbacks
 """
 from flask import Blueprint, request, jsonify, current_app
 from flask_jwt_extended import (
@@ -13,113 +13,45 @@ from app.utils.validators import validate_password, validate_email
 from app.utils.security import hash_password, check_password
 from flask_mail import Message
 from datetime import datetime, timedelta
-import random, string, traceback, os, smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import random, string, traceback, os
 
 auth_bp = Blueprint('auth', __name__)
 
 
-# ── Email sender with dual method ────────────────────────────
+# ── Email sender ──────────────────────────────────────────────
 
 def _send_otp_email(to_email: str, name: str, otp: str, purpose: str):
-    """
-    Send OTP email.
-    Tries Flask-Mail first, falls back to direct smtplib if it fails.
-    smtplib works more reliably on Render/cloud hosting.
-    """
-    username = os.getenv('MAIL_USERNAME', '')
-    password = os.getenv('MAIL_PASSWORD', '')
-
-    if not username or not password:
-        raise ValueError("MAIL_USERNAME or MAIL_PASSWORD not set in environment")
-
-    subject  = f"InterviewAI — {purpose} OTP: {otp}"
-    html_body = f"""
+    """Send OTP via Brevo SMTP using Flask-Mail."""
+    html = f"""
 <!DOCTYPE html>
 <html>
 <body style="margin:0;padding:0;background:#0f172a;font-family:Arial,sans-serif;">
-  <div style="max-width:520px;margin:40px auto;background:#1e293b;border-radius:16px;
-              padding:40px;border:1px solid #334155;">
-    <h2 style="color:#6366f1;margin:0 0 4px 0;font-size:24px;">InterviewAI</h2>
-    <p style="color:#64748b;font-size:13px;margin:0 0 28px 0;">AI Mock Interview Portal</p>
-    <p style="color:#e2e8f0;font-size:15px;">Hi <strong>{name}</strong>,</p>
-    <p style="color:#94a3b8;font-size:14px;margin-bottom:20px;">
-      Your <strong style="color:#e2e8f0;">{purpose}</strong> OTP is:
-    </p>
+  <div style="max-width:520px;margin:40px auto;background:#1e293b;
+              border-radius:16px;padding:40px;border:1px solid #334155;">
+    <h2 style="color:#6366f1;margin:0 0 4px 0;">InterviewAI</h2>
+    <p style="color:#64748b;font-size:13px;margin:0 0 24px 0;">AI Mock Interview Portal</p>
+    <p style="color:#e2e8f0;">Hi <strong>{name}</strong>,</p>
+    <p style="color:#94a3b8;">Your <strong style="color:#e2e8f0;">{purpose}</strong> OTP:</p>
     <div style="background:#0f172a;border:2px solid #6366f1;border-radius:12px;
-                padding:28px;text-align:center;margin:0 0 24px 0;">
-      <span style="color:#6366f1;font-size:42px;font-weight:bold;
-                   letter-spacing:18px;font-family:monospace;">{otp}</span>
+                padding:24px;text-align:center;margin:20px 0;">
+      <span style="color:#6366f1;font-size:40px;font-weight:bold;
+                   letter-spacing:16px;font-family:monospace;">{otp}</span>
     </div>
-    <p style="color:#64748b;font-size:13px;">⏱ Expires in <strong>10 minutes</strong>.</p>
-    <p style="color:#64748b;font-size:13px;">🔒 Never share this OTP with anyone.</p>
-    <hr style="border:none;border-top:1px solid #334155;margin:24px 0;" />
-    <p style="color:#475569;font-size:12px;">
-      If you did not request this, please ignore this email.
-    </p>
+    <p style="color:#64748b;font-size:13px;">⏱ Expires in 10 minutes.</p>
+    <p style="color:#64748b;font-size:13px;">🔒 Never share this OTP.</p>
   </div>
 </body>
 </html>"""
 
-    last_error = None
-
-    # Method 1: Try port 587 TLS (standard)
-    try:
-        current_app.logger.info(f"Trying SMTP port 587 TLS to {to_email}...")
-        _send_via_smtplib(username, password, to_email, subject, html_body, port=587, use_ssl=False)
-        current_app.logger.info(f"Email sent via port 587 to {to_email}")
-        return
-    except Exception as e:
-        last_error = e
-        current_app.logger.warning(f"Port 587 failed: {e}")
-
-    # Method 2: Try port 465 SSL
-    try:
-        current_app.logger.info(f"Trying SMTP port 465 SSL to {to_email}...")
-        _send_via_smtplib(username, password, to_email, subject, html_body, port=465, use_ssl=True)
-        current_app.logger.info(f"Email sent via port 465 to {to_email}")
-        return
-    except Exception as e:
-        last_error = e
-        current_app.logger.warning(f"Port 465 failed: {e}")
-
-    # Method 3: Try Flask-Mail as last resort
-    try:
-        current_app.logger.info(f"Trying Flask-Mail to {to_email}...")
-        msg = Message(subject=subject, recipients=[to_email], html=html_body)
-        mail.send(msg)
-        current_app.logger.info(f"Email sent via Flask-Mail to {to_email}")
-        return
-    except Exception as e:
-        last_error = e
-        current_app.logger.warning(f"Flask-Mail failed: {e}")
-
-    # All methods failed
-    raise RuntimeError(f"All email methods failed. Last error: {last_error}")
-
-
-def _send_via_smtplib(username, password, to_email, subject, html_body, port=587, use_ssl=False):
-    """Send email via direct smtplib connection."""
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"]    = f"InterviewAI <{username}>"
-    msg["To"]      = to_email
-    msg.attach(MIMEText(html_body, "html"))
-
-    if use_ssl:
-        # Port 465 — SSL from start
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
-            server.login(username, password)
-            server.sendmail(username, to_email, msg.as_string())
-    else:
-        # Port 587 — STARTTLS
-        with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
-            server.ehlo()
-            server.starttls()
-            server.ehlo()
-            server.login(username, password)
-            server.sendmail(username, to_email, msg.as_string())
+    sender_email = os.getenv('MAIL_DEFAULT_SENDER') or os.getenv('MAIL_USERNAME')
+    msg = Message(
+        subject=f"InterviewAI — {purpose} OTP: {otp}",
+        sender=('InterviewAI', sender_email),
+        recipients=[to_email],
+        html=html,
+    )
+    mail.send(msg)
+    current_app.logger.info(f"OTP email sent to {to_email} via {os.getenv('MAIL_SERVER')}")
 
 
 # ── Register ──────────────────────────────────────────────────
@@ -138,11 +70,11 @@ def register():
 
     errors = {}
     if not full_name or len(full_name) < 2:
-        errors['full_name'] = 'Full name must be at least 2 characters'
+        errors['full_name'] = 'Minimum 2 characters'
     if not validate_email(email):
         errors['email'] = 'Invalid email address'
     if not validate_password(password):
-        errors['password'] = 'Need 8+ chars, uppercase, lowercase, number & special char'
+        errors['password'] = '8+ chars, uppercase, lowercase, number & special char'
     if password != confirm_password:
         errors['confirm_password'] = 'Passwords do not match'
     if errors:
@@ -162,24 +94,27 @@ def register():
 
     otp = ''.join(random.choices(string.digits, k=6))
     db.session.add(OTPToken(
-        user_id=user.id, token=otp, token_type='email_verify',
+        user_id=user.id, token=otp,
+        token_type='email_verify',
         expires_at=datetime.utcnow() + timedelta(minutes=10),
     ))
     db.session.commit()
 
-    email_error = None
     try:
         _send_otp_email(email, full_name, otp, 'Email Verification')
-        current_app.logger.info(f'OTP email sent to {email}')
+        return jsonify({
+            'message': 'Registration successful! Check your email for OTP.',
+            'user_id': user.id,
+        }), 201
     except Exception as e:
-        email_error = str(e)
-        current_app.logger.error(f'Email failed for {email}: {traceback.format_exc()}')
-
-    resp = {'message': 'Registration successful. Check your email for OTP.', 'user_id': user.id}
-    if email_error:
-        resp['message'] = 'Account created but email delivery failed. Contact support or use Resend OTP.'
-        resp['email_error'] = email_error
-    return jsonify(resp), 201
+        err = traceback.format_exc()
+        current_app.logger.error(f"Email send FAILED:\n{err}")
+        # Account is created — user can use resend OTP
+        return jsonify({
+            'message': 'Account created but email failed. Use Resend OTP button.',
+            'user_id': user.id,
+            'email_error': str(e),
+        }), 201
 
 
 # ── Resend OTP ────────────────────────────────────────────────
@@ -190,7 +125,7 @@ def resend_otp():
     data    = request.get_json() or {}
     user_id = data.get('user_id')
     if not user_id:
-        return jsonify({'message': 'user_id is required'}), 400
+        return jsonify({'message': 'user_id required'}), 400
 
     user = User.query.get(user_id)
     if not user:
@@ -198,7 +133,9 @@ def resend_otp():
     if user.is_verified:
         return jsonify({'message': 'Email already verified'}), 400
 
-    OTPToken.query.filter_by(user_id=user.id, token_type='email_verify', is_used=False).delete()
+    OTPToken.query.filter_by(
+        user_id=user.id, token_type='email_verify', is_used=False
+    ).delete()
 
     otp = ''.join(random.choices(string.digits, k=6))
     db.session.add(OTPToken(
@@ -209,10 +146,10 @@ def resend_otp():
 
     try:
         _send_otp_email(user.email, user.full_name, otp, 'Email Verification')
-        return jsonify({'message': 'OTP resent successfully'}), 200
+        return jsonify({'message': 'OTP resent! Check your email.'}), 200
     except Exception as e:
-        current_app.logger.error(f'Resend OTP failed: {traceback.format_exc()}')
-        return jsonify({'message': f'Email delivery failed: {str(e)}'}), 500
+        current_app.logger.error(f"Resend OTP failed:\n{traceback.format_exc()}")
+        return jsonify({'message': f'Email failed: {str(e)}'}), 500
 
 
 # ── Verify Email ──────────────────────────────────────────────
@@ -229,11 +166,10 @@ def verify_email():
     ).first()
 
     if not token or token.expires_at < datetime.utcnow():
-        return jsonify({'message': 'Invalid or expired OTP. Request a new one.'}), 400
+        return jsonify({'message': 'Invalid or expired OTP.'}), 400
 
     token.is_used = True
-    user = User.query.get(user_id)
-    user.is_verified = True
+    User.query.get(user_id).is_verified = True
     db.session.commit()
     return jsonify({'message': 'Email verified! You can now login.'}), 200
 
@@ -252,7 +188,7 @@ def login():
     if not user or not check_password(password, user.password_hash):
         return jsonify({'message': 'Invalid email or password'}), 401
     if not user.is_active:
-        return jsonify({'message': 'Account deactivated. Contact support.'}), 403
+        return jsonify({'message': 'Account deactivated.'}), 403
     if not user.is_verified:
         return jsonify({
             'message': 'Please verify your email first.',
@@ -263,14 +199,11 @@ def login():
     user.last_login = datetime.utcnow()
     db.session.commit()
 
-    expires       = timedelta(days=30) if remember else timedelta(hours=2)
-    access_token  = create_access_token(identity=str(user.id), expires_delta=expires)
-    refresh_token = create_refresh_token(identity=str(user.id))
-
+    expires = timedelta(days=30) if remember else timedelta(hours=2)
     return jsonify({
         'message': 'Login successful',
-        'access_token': access_token,
-        'refresh_token': refresh_token,
+        'access_token':  create_access_token(identity=str(user.id), expires_delta=expires),
+        'refresh_token': create_refresh_token(identity=str(user.id)),
         'user': user.to_dict(),
     }), 200
 
@@ -298,22 +231,17 @@ def forgot_password():
         OTPToken.query.filter_by(
             user_id=user.id, token_type='password_reset', is_used=False
         ).delete()
-
         otp = ''.join(random.choices(string.digits, k=6))
         db.session.add(OTPToken(
             user_id=user.id, token=otp, token_type='password_reset',
             expires_at=datetime.utcnow() + timedelta(minutes=15),
         ))
         db.session.commit()
-
         try:
             _send_otp_email(email, user.full_name, otp, 'Password Reset')
-            current_app.logger.info(f'Password reset OTP sent to {email}')
         except Exception as e:
-            current_app.logger.error(f'Password reset email failed: {traceback.format_exc()}')
-            return jsonify({
-                'message': f'Email delivery failed: {str(e)}'
-            }), 500
+            current_app.logger.error(f"Forgot password email failed:\n{traceback.format_exc()}")
+            return jsonify({'message': f'Email failed: {str(e)}'}), 500
 
     return jsonify({'message': 'If this email exists, an OTP has been sent.'}), 200
 
@@ -328,7 +256,7 @@ def reset_password():
     new_password = data.get('new_password', '')
 
     if not validate_password(new_password):
-        return jsonify({'message': 'Password must be 8+ chars with uppercase, lowercase, number & special char'}), 422
+        return jsonify({'message': 'Password needs 8+ chars, upper, lower, number & special'}), 422
 
     user = User.query.filter_by(email=email).first()
     if not user:
@@ -373,47 +301,64 @@ def update_profile():
     return jsonify({'message': 'Profile updated', 'user': user.to_dict()}), 200
 
 
-# ── SMTP Test ─────────────────────────────────────────────────
+# ── Test Email ────────────────────────────────────────────────
 
 @auth_bp.route('/test-email', methods=['GET'])
 def test_email():
-    """Test SMTP — visit in browser: /api/auth/test-email"""
-    username = os.getenv('MAIL_USERNAME', '')
-    password = os.getenv('MAIL_PASSWORD', '')
+    """Test Brevo SMTP — open in browser"""
+    username = os.getenv('MAIL_USERNAME', 'NOT SET')
+    server   = os.getenv('MAIL_SERVER',   'NOT SET')
+    port     = os.getenv('MAIL_PORT',     'NOT SET')
+    sender   = os.getenv('MAIL_DEFAULT_SENDER', username)
 
-    if not username:
-        return jsonify({'status': 'FAILED', 'reason': 'MAIL_USERNAME not set'}), 500
-    if not password:
-        return jsonify({'status': 'FAILED', 'reason': 'MAIL_PASSWORD not set'}), 500
+    config_info = {
+        'MAIL_SERVER':   server,
+        'MAIL_PORT':     port,
+        'MAIL_USERNAME': username,
+        'MAIL_DEFAULT_SENDER': sender,
+        'MAIL_USE_TLS':  os.getenv('MAIL_USE_TLS', 'not set'),
+        'MAIL_USE_SSL':  os.getenv('MAIL_USE_SSL', 'not set'),
+        'password_set':  bool(os.getenv('MAIL_PASSWORD')),
+    }
 
-    results = {}
+    if username == 'NOT SET' or not os.getenv('MAIL_PASSWORD'):
+        return jsonify({
+            'status': 'FAILED',
+            'reason': 'MAIL_USERNAME or MAIL_PASSWORD not configured',
+            'config': config_info,
+        }), 500
 
-    # Test port 587
     try:
-        _send_via_smtplib(username, password, username,
-                          'InterviewAI SMTP Test (587)', '<p>Port 587 works!</p>', port=587, use_ssl=False)
-        results['port_587'] = 'SUCCESS'
+        msg = Message(
+            subject='InterviewAI — SMTP Test ✅',
+            sender=('InterviewAI', sender),
+            recipients=[sender],
+            html='<div style="font-family:Arial;padding:20px;">'
+                 '<h2 style="color:#6366f1;">✅ Email is working!</h2>'
+                 f'<p>Sent via {server}:{port}</p></div>',
+        )
+        mail.send(msg)
+        return jsonify({
+            'status': 'SUCCESS',
+            'message': f'Test email sent to {sender}. Check inbox!',
+            'config': config_info,
+        }), 200
     except Exception as e:
-        results['port_587'] = f'FAILED: {str(e)}'
-
-    # Test port 465
-    try:
-        _send_via_smtplib(username, password, username,
-                          'InterviewAI SMTP Test (465)', '<p>Port 465 works!</p>', port=465, use_ssl=True)
-        results['port_465'] = 'SUCCESS'
-    except Exception as e:
-        results['port_465'] = f'FAILED: {str(e)}'
-
-    any_success = any('SUCCESS' in v for v in results.values())
-    return jsonify({
-        'status': 'SUCCESS' if any_success else 'FAILED',
-        'sender': username,
-        'results': results,
-        'message': 'Check your inbox!' if any_success else 'Both ports failed — check Gmail App Password',
-    }), 200 if any_success else 500
+        return jsonify({
+            'status': 'FAILED',
+            'error': str(e),
+            'config': config_info,
+            'hint': (
+                'Wrong SMTP key — regenerate on Brevo dashboard'
+                if 'authentication' in str(e).lower() else
+                'Connection refused — check MAIL_SERVER and MAIL_PORT'
+                if 'connect' in str(e).lower() else
+                str(e)
+            ),
+        }), 500
 
 
-# ── Claude API Test ───────────────────────────────────────────
+# ── Test Claude ───────────────────────────────────────────────
 
 @auth_bp.route('/test-claude', methods=['GET'])
 def test_claude():
@@ -426,12 +371,14 @@ def test_claude():
             'https://api.anthropic.com/v1/messages',
             headers={'x-api-key': api_key, 'anthropic-version': '2023-06-01',
                      'content-type': 'application/json'},
-            json={'model': 'claude-haiku-4-5', 'max_tokens': 30,
+            json={'model': 'claude-haiku-4-5', 'max_tokens': 20,
                   'messages': [{'role': 'user', 'content': 'Say OK'}]},
             timeout=30,
         )
         if resp.status_code == 200:
-            return jsonify({'status': 'SUCCESS', 'response': resp.json()['content'][0]['text']}), 200
-        return jsonify({'status': 'FAILED', 'http_status': resp.status_code, 'error': resp.text[:300]}), 500
+            return jsonify({'status': 'SUCCESS',
+                            'response': resp.json()['content'][0]['text']}), 200
+        return jsonify({'status': 'FAILED', 'http': resp.status_code,
+                        'error': resp.text[:200]}), 500
     except Exception as e:
         return jsonify({'status': 'FAILED', 'error': str(e)}), 500
