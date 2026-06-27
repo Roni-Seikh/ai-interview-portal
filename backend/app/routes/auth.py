@@ -1,7 +1,3 @@
-"""
-Auth Routes - No email verification required
-Registration is instant. Password reset uses security question instead of OTP.
-"""
 from flask import Blueprint, request, jsonify, current_app
 from flask_jwt_extended import (
     create_access_token, create_refresh_token,
@@ -12,12 +8,10 @@ from app.models import User, OTPToken
 from app.utils.validators import validate_password, validate_email
 from app.utils.security import hash_password, check_password
 from datetime import datetime, timedelta
-import traceback, os
+import traceback, os, secrets
 
 auth_bp = Blueprint('auth', __name__)
 
-
-# ── Register (instant - no email verification) ────────────────
 
 @auth_bp.route('/register', methods=['POST'])
 @limiter.limit("10 per minute")
@@ -43,26 +37,26 @@ def register():
     if errors:
         return jsonify({'message': 'Validation failed', 'errors': errors}), 422
 
-    if User.query.filter_by(email=email).first():
+    existing = User.query.filter_by(email=email).first()
+    if existing:
         return jsonify({
             'message': 'Email already registered. Please login instead.',
             'errors': {'email': 'Already in use'}
         }), 409
 
-    # Create user — instantly verified, no OTP needed
     user = User(
         full_name=full_name,
         email=email,
         password_hash=hash_password(password),
         role='student',
         is_active=True,
-        is_verified=True,   # ← instantly verified
+        is_verified=True,
     )
     db.session.add(user)
     db.session.commit()
 
-    # Auto-login after registration
-    access_token  = create_access_token(identity=str(user.id), expires_delta=timedelta(hours=2))
+    access_token  = create_access_token(
+        identity=str(user.id), expires_delta=timedelta(hours=2))
     refresh_token = create_refresh_token(identity=str(user.id))
 
     return jsonify({
@@ -74,8 +68,6 @@ def register():
         'user': user.to_dict(),
     }), 201
 
-
-# ── Login ─────────────────────────────────────────────────────
 
 @auth_bp.route('/login', methods=['POST'])
 @limiter.limit("20 per minute")
@@ -91,7 +83,7 @@ def login():
     if not user.is_active:
         return jsonify({'message': 'Account deactivated. Contact support.'}), 403
 
-    # Fix any stuck unverified accounts automatically
+    # Auto-fix any stuck unverified accounts
     if not user.is_verified:
         user.is_verified = True
 
@@ -101,13 +93,12 @@ def login():
     expires = timedelta(days=30) if remember else timedelta(hours=2)
     return jsonify({
         'message': 'Login successful',
-        'access_token':  create_access_token(identity=str(user.id), expires_delta=expires),
+        'access_token':  create_access_token(
+            identity=str(user.id), expires_delta=expires),
         'refresh_token': create_refresh_token(identity=str(user.id)),
         'user': user.to_dict(),
     }), 200
 
-
-# ── Refresh ───────────────────────────────────────────────────
 
 @auth_bp.route('/refresh', methods=['POST'])
 @jwt_required(refresh=True)
@@ -117,84 +108,114 @@ def refresh():
     }), 200
 
 
-# ── Forgot Password — returns token directly (no email needed) ─
-
 @auth_bp.route('/forgot-password', methods=['POST'])
 @limiter.limit("10 per minute")
 def forgot_password():
     """
-    Instead of email OTP, verify by checking email exists in DB.
-    Returns a reset_token directly to the frontend.
-    User must know their registered email to get the token.
+    No email sent. Returns reset_token directly if email exists.
     """
-    data  = request.get_json() or {}
-    email = data.get('email', '').strip().lower()
+    try:
+        data  = request.get_json() or {}
+        email = data.get('email', '').strip().lower()
 
-    user = User.query.filter_by(email=email).first()
-    if not user:
-        # Vague message to prevent email enumeration
-        return jsonify({'message': 'If this email is registered, a reset link has been generated.', 'found': False}), 200
+        if not email:
+            return jsonify({'message': 'Email is required', 'found': False}), 400
 
-    # Generate a secure reset token and store it
-    import secrets
-    reset_token = secrets.token_urlsafe(32)
+        user = User.query.filter_by(email=email).first()
 
-    # Invalidate old tokens
-    OTPToken.query.filter_by(user_id=user.id, token_type='password_reset', is_used=False).delete()
+        if not user:
+            return jsonify({
+                'message': 'No account found with this email address.',
+                'found': False
+            }), 200
 
-    db.session.add(OTPToken(
-        user_id=user.id,
-        token=reset_token,
-        token_type='password_reset',
-        expires_at=datetime.utcnow() + timedelta(minutes=30),
-    ))
-    db.session.commit()
+        # Delete old tokens
+        OTPToken.query.filter_by(
+            user_id=user.id,
+            token_type='password_reset',
+            is_used=False
+        ).delete()
+        db.session.flush()
 
-    # Return the token directly — frontend will use it
-    return jsonify({
-        'message': 'Email found. You can now reset your password.',
-        'found': True,
-        'reset_token': reset_token,
-        'user_id': user.id,
-    }), 200
+        # Generate secure token
+        reset_token = secrets.token_urlsafe(32)
 
+        db.session.add(OTPToken(
+            user_id=user.id,
+            token=reset_token,
+            token_type='password_reset',
+            expires_at=datetime.utcnow() + timedelta(minutes=30),
+        ))
+        db.session.commit()
 
-# ── Reset Password using token (no OTP needed) ────────────────
+        current_app.logger.info(
+            f"Password reset token generated for user {user.id} ({email})"
+        )
+
+        return jsonify({
+            'message': 'Email found. You can now reset your password.',
+            'found': True,
+            'reset_token': reset_token,
+            'user_id': user.id,
+        }), 200
+
+    except Exception:
+        current_app.logger.error(
+            f"forgot_password error:\n{traceback.format_exc()}"
+        )
+        db.session.rollback()
+        return jsonify({'message': 'Server error. Please try again.', 'found': False}), 500
+
 
 @auth_bp.route('/reset-password', methods=['POST'])
 def reset_password():
-    data         = request.get_json() or {}
-    user_id      = data.get('user_id')
-    reset_token  = data.get('reset_token', '').strip()
-    new_password = data.get('new_password', '')
+    try:
+        data         = request.get_json() or {}
+        user_id      = data.get('user_id')
+        reset_token  = data.get('reset_token', '').strip()
+        new_password = data.get('new_password', '')
 
-    if not validate_password(new_password):
-        return jsonify({
-            'message': 'Password needs 8+ chars, uppercase, lowercase, number & special char'
-        }), 422
+        if not user_id or not reset_token:
+            return jsonify({
+                'message': 'Invalid request — missing user_id or reset_token'
+            }), 400
 
-    if not user_id or not reset_token:
-        return jsonify({'message': 'Invalid request — missing user_id or reset_token'}), 400
+        if not validate_password(new_password):
+            return jsonify({
+                'message': 'Password needs 8+ chars, uppercase, lowercase, number & special char (!@#$%^&*)'
+            }), 422
 
-    token = OTPToken.query.filter_by(
-        user_id=user_id,
-        token=reset_token,
-        token_type='password_reset',
-        is_used=False,
-    ).first()
+        token = OTPToken.query.filter_by(
+            user_id=user_id,
+            token=reset_token,
+            token_type='password_reset',
+            is_used=False,
+        ).first()
 
-    if not token or token.expires_at < datetime.utcnow():
-        return jsonify({'message': 'Reset link expired. Please start again.'}), 400
+        if not token:
+            return jsonify({'message': 'Invalid reset token. Please start again.'}), 400
 
-    token.is_used = True
-    user = User.query.get(user_id)
-    user.password_hash = hash_password(new_password)
-    db.session.commit()
+        if token.expires_at < datetime.utcnow():
+            return jsonify({'message': 'Reset token expired. Please start again.'}), 400
 
-    return jsonify({'message': 'Password reset successfully! You can now login.'}), 200
+        token.is_used = True
+        user = User.query.get(user_id)
+        if not user:
+            return jsonify({'message': 'User not found'}), 404
 
+        user.password_hash = hash_password(new_password)
+        db.session.commit()
 
-# ── Get current user ──────────────────────────────────────────
+        current_app.logger.info(f"Password reset successful for user {user_id}")
+        return jsonify({'message': 'Password reset successfully! You can now login.'}), 200
+
+    except Exception:
+        current_app.logger.error(
+            f"reset_password error:\n{traceback.format_exc()}"
+        )
+        db.session.rollback()
+        return jsonify({'message': 'Server error. Please try again.'}), 500
+
 
 @auth_bp.route('/me', methods=['GET'])
 @jwt_required()
@@ -204,8 +225,6 @@ def get_me():
         return jsonify({'message': 'User not found'}), 404
     return jsonify({'user': user.to_dict()}), 200
 
-
-# ── Update profile ────────────────────────────────────────────
 
 @auth_bp.route('/update-profile', methods=['PUT'])
 @jwt_required()
@@ -220,13 +239,72 @@ def update_profile():
     return jsonify({'message': 'Profile updated', 'user': user.to_dict()}), 200
 
 
-# ── Health check for email config ─────────────────────────────
-
 @auth_bp.route('/test-email', methods=['GET'])
 def test_email():
     return jsonify({
         'status': 'Email verification disabled',
-        'message': 'Registration is now instant — no email required.',
-        'MAIL_SERVER': os.getenv('MAIL_SERVER', 'not set'),
-        'MAIL_USERNAME': os.getenv('MAIL_USERNAME', 'not set'),
+        'message': 'Registration is instant. Password reset uses secure tokens.',
+    }), 200
+
+
+@auth_bp.route('/test-claude', methods=['GET'])
+def test_claude():
+    import requests as req
+    api_key = os.getenv('ANTHROPIC_API_KEY', '')
+    if not api_key:
+        return jsonify({'status': 'FAILED', 'reason': 'ANTHROPIC_API_KEY not set'}), 500
+    try:
+        resp = req.post(
+            'https://api.anthropic.com/v1/messages',
+            headers={
+                'x-api-key': api_key,
+                'anthropic-version': '2023-06-01',
+                'content-type': 'application/json'
+            },
+            json={
+                'model': 'claude-haiku-4-5',
+                'max_tokens': 20,
+                'messages': [{'role': 'user', 'content': 'Say OK'}]
+            },
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            return jsonify({
+                'status': 'SUCCESS',
+                'response': resp.json()['content'][0]['text']
+            }), 200
+        return jsonify({
+            'status': 'FAILED',
+            'http': resp.status_code,
+            'error': resp.text[:200]
+        }), 500
+    except Exception as e:
+        return jsonify({'status': 'FAILED', 'error': str(e)}), 500
+
+
+# ── Debug endpoint — check what otp_tokens table has ─────────
+@auth_bp.route('/debug-reset/<email>', methods=['GET'])
+def debug_reset(email):
+    """Temporary debug — remove after fixing"""
+    user = User.query.filter_by(email=email.lower()).first()
+    if not user:
+        return jsonify({'error': 'user not found', 'email': email}), 404
+
+    tokens = OTPToken.query.filter_by(
+        user_id=user.id, token_type='password_reset'
+    ).all()
+
+    return jsonify({
+        'user_id':    user.id,
+        'email':      user.email,
+        'is_verified': user.is_verified,
+        'tokens': [
+            {
+                'id':         t.id,
+                'is_used':    t.is_used,
+                'expires_at': t.expires_at.isoformat(),
+                'expired':    t.expires_at < datetime.utcnow(),
+            }
+            for t in tokens
+        ]
     }), 200
