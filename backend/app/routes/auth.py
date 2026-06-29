@@ -51,7 +51,8 @@ def register():
     db.session.add(user)
     db.session.commit()
 
-    access_token  = create_access_token(identity=str(user.id), expires_delta=timedelta(hours=2))
+    access_token  = create_access_token(
+        identity=str(user.id), expires_delta=timedelta(hours=2))
     refresh_token = create_refresh_token(identity=str(user.id))
 
     return jsonify({
@@ -76,8 +77,7 @@ def login():
     if not user or not check_password(password, user.password_hash):
         return jsonify({'message': 'Invalid email or password'}), 401
     if not user.is_active:
-        return jsonify({'message': 'Account deactivated. Contact support.'}), 403
-
+        return jsonify({'message': 'Account deactivated.'}), 403
     if not user.is_verified:
         user.is_verified = True
 
@@ -87,7 +87,8 @@ def login():
     expires = timedelta(days=30) if remember else timedelta(hours=2)
     return jsonify({
         'message': 'Login successful',
-        'access_token':  create_access_token(identity=str(user.id), expires_delta=expires),
+        'access_token':  create_access_token(
+            identity=str(user.id), expires_delta=expires),
         'refresh_token': create_refresh_token(identity=str(user.id)),
         'user': user.to_dict(),
     }), 200
@@ -104,7 +105,10 @@ def refresh():
 @auth_bp.route('/forgot-password', methods=['POST'])
 @limiter.limit("10 per minute")
 def forgot_password():
-    """Returns reset_token directly — no email needed."""
+    """
+    Returns reset_token directly — no email needed.
+    Fixed: uses raw SQL to avoid SQLAlchemy constraint issues.
+    """
     data  = request.get_json() or {}
     email = data.get('email', '').strip().lower()
 
@@ -113,50 +117,37 @@ def forgot_password():
 
     try:
         user = User.query.filter_by(email=email).first()
-
         if not user:
             return jsonify({
                 'message': 'No account found with this email.',
                 'found': False
             }), 200
 
-        # Delete ALL old password_reset tokens for this user
-        deleted = db.session.query(OTPToken).filter(
-            OTPToken.user_id == user.id,
-            OTPToken.token_type == 'password_reset'
-        ).delete(synchronize_session=False)
-        db.session.flush()
+        # Use raw SQL to delete old tokens — avoids any ORM constraint issues
+        db.session.execute(
+            db.text(
+                "DELETE FROM otp_tokens WHERE user_id = :uid AND token_type = 'password_reset'"
+            ),
+            {'uid': user.id}
+        )
+        db.session.commit()
 
-        current_app.logger.info(f"Deleted {deleted} old reset tokens for user {user.id}")
-
-        # Create new token
+        # Generate new token
         reset_token = secrets.token_urlsafe(32)
         expires     = datetime.utcnow() + timedelta(minutes=30)
 
-        new_token = OTPToken(
-            user_id    = user.id,
-            token      = reset_token,
-            token_type = 'password_reset',
-            expires_at = expires,
-            is_used    = False,
+        # Use raw SQL to insert — bypasses any ORM model issues
+        db.session.execute(
+            db.text(
+                "INSERT INTO otp_tokens (user_id, token, token_type, expires_at, is_used) "
+                "VALUES (:uid, :token, 'password_reset', :exp, 0)"
+            ),
+            {'uid': user.id, 'token': reset_token, 'exp': expires}
         )
-        db.session.add(new_token)
         db.session.commit()
 
-        # Verify it was saved
-        saved = OTPToken.query.filter_by(
-            user_id    = user.id,
-            token      = reset_token,
-            token_type = 'password_reset',
-        ).first()
-
-        if not saved:
-            current_app.logger.error("Token was NOT saved to DB!")
-            return jsonify({'message': 'Database error. Please try again.', 'found': False}), 500
-
         current_app.logger.info(
-            f"Reset token saved for user {user.id} ({email}), "
-            f"token_id={saved.id}, expires={expires}"
+            f"Reset token saved for user {user.id} ({email})"
         )
 
         return jsonify({
@@ -169,24 +160,20 @@ def forgot_password():
     except Exception:
         db.session.rollback()
         err = traceback.format_exc()
-        current_app.logger.error(f"forgot_password EXCEPTION:\n{err}")
+        current_app.logger.error(f"forgot_password error:\n{err}")
         return jsonify({
-            'message': f'Server error: {str(err[-200:])}',
-            'found': False
+            'message': 'Database error. Please try again.',
+            'found': False,
+            'detail': err[-300:]
         }), 500
 
 
 @auth_bp.route('/reset-password', methods=['POST'])
 def reset_password():
-    data         = request.get_json() or {}
-    user_id      = data.get('user_id')
-    reset_token  = data.get('reset_token', '').strip()
-    new_password = data.get('new_password', '')
-
-    current_app.logger.info(
-        f"reset_password called: user_id={user_id}, "
-        f"token_len={len(reset_token)}, pwd_len={len(new_password)}"
-    )
+    data        = request.get_json() or {}
+    user_id     = data.get('user_id')
+    reset_token = data.get('reset_token', '').strip()
+    new_password= data.get('new_password', '')
 
     if not user_id or not reset_token:
         return jsonify({'message': 'Missing user_id or reset_token'}), 400
@@ -197,31 +184,33 @@ def reset_password():
         }), 422
 
     try:
-        token = OTPToken.query.filter_by(
-            user_id    = user_id,
-            token      = reset_token,
-            token_type = 'password_reset',
-            is_used    = False,
-        ).first()
+        # Use raw SQL to find token
+        result = db.session.execute(
+            db.text(
+                "SELECT id, expires_at, is_used FROM otp_tokens "
+                "WHERE user_id = :uid AND token = :tok AND token_type = 'password_reset'"
+            ),
+            {'uid': user_id, 'tok': reset_token}
+        ).fetchone()
 
-        current_app.logger.info(f"Token lookup result: {token}")
+        if not result:
+            return jsonify({'message': 'Invalid reset link. Please start again.'}), 400
 
-        if not token:
-            # Check if it exists but is used or expired
-            any_token = OTPToken.query.filter_by(
-                user_id=user_id, token_type='password_reset'
-            ).first()
-            if any_token:
-                current_app.logger.warning(
-                    f"Token exists but is_used={any_token.is_used}, "
-                    f"expires={any_token.expires_at}"
-                )
-            return jsonify({'message': 'Invalid or expired reset link. Please start again.'}), 400
+        token_id, expires_at, is_used = result[0], result[1], result[2]
 
-        if token.expires_at < datetime.utcnow():
+        if is_used:
+            return jsonify({'message': 'Reset link already used. Please start again.'}), 400
+
+        if expires_at < datetime.utcnow():
             return jsonify({'message': 'Reset link expired. Please start again.'}), 400
 
-        token.is_used = True
+        # Mark token as used
+        db.session.execute(
+            db.text("UPDATE otp_tokens SET is_used = 1 WHERE id = :tid"),
+            {'tid': token_id}
+        )
+
+        # Update password
         user = User.query.get(user_id)
         if not user:
             return jsonify({'message': 'User not found'}), 404
@@ -229,14 +218,14 @@ def reset_password():
         user.password_hash = hash_password(new_password)
         db.session.commit()
 
-        current_app.logger.info(f"Password reset successful for user {user_id}")
+        current_app.logger.info(f"Password reset OK for user {user_id}")
         return jsonify({'message': 'Password reset! You can now login.'}), 200
 
     except Exception:
         db.session.rollback()
         err = traceback.format_exc()
-        current_app.logger.error(f"reset_password EXCEPTION:\n{err}")
-        return jsonify({'message': f'Server error. Try again.'}), 500
+        current_app.logger.error(f"reset_password error:\n{err}")
+        return jsonify({'message': 'Server error. Please try again.'}), 500
 
 
 @auth_bp.route('/me', methods=['GET'])
@@ -264,8 +253,8 @@ def update_profile():
 @auth_bp.route('/test-email', methods=['GET'])
 def test_email():
     return jsonify({
-        'status': 'No email needed',
-        'message': 'Registration is instant. Password reset uses secure tokens.',
+        'status': 'OK',
+        'message': 'No email needed. Registration is instant. Password reset uses secure tokens.',
     }), 200
 
 
@@ -293,70 +282,24 @@ def test_claude():
         return jsonify({'status': 'FAILED', 'error': str(e)}), 500
 
 
-@auth_bp.route('/debug-reset/<email>', methods=['GET'])
+@auth_bp.route('/debug-reset/<path:email>', methods=['GET'])
 def debug_reset(email):
-    """Debug — check DB state for a user's reset tokens"""
     user = User.query.filter_by(email=email.lower()).first()
     if not user:
-        return jsonify({'error': 'user not found', 'email': email}), 404
-
-    tokens = OTPToken.query.filter_by(
-        user_id=user.id, token_type='password_reset'
-    ).all()
-
+        return jsonify({'error': 'user not found'}), 404
+    rows = db.session.execute(
+        db.text("SELECT id, token_type, expires_at, is_used FROM otp_tokens WHERE user_id = :uid"),
+        {'uid': user.id}
+    ).fetchall()
     return jsonify({
         'user_id':    user.id,
         'email':      user.email,
         'is_verified': user.is_verified,
         'now_utc':    datetime.utcnow().isoformat(),
         'tokens': [
-            {
-                'id':         t.id,
-                'is_used':    t.is_used,
-                'expires_at': t.expires_at.isoformat(),
-                'expired':    t.expires_at < datetime.utcnow(),
-                'token_preview': t.token[:10] + '...' if t.token else None,
-            }
-            for t in tokens
+            {'id': r[0], 'type': r[1],
+             'expires': r[2].isoformat() if r[2] else None,
+             'is_used': r[3]}
+            for r in rows
         ]
     }), 200
-
-
-@auth_bp.route('/debug-db', methods=['GET'])
-def debug_db():
-    """Check if DB writes work at all"""
-    try:
-        # Try a simple write
-        test_user = User.query.first()
-        if not test_user:
-            return jsonify({'error': 'no users in DB'}), 500
-
-        test_token = OTPToken(
-            user_id    = test_user.id,
-            token      = 'DEBUGTEST123',
-            token_type = 'password_reset',
-            expires_at = datetime.utcnow() + timedelta(minutes=1),
-            is_used    = False,
-        )
-        db.session.add(test_token)
-        db.session.commit()
-
-        # Verify
-        found = OTPToken.query.filter_by(token='DEBUGTEST123').first()
-
-        # Clean up
-        if found:
-            db.session.delete(found)
-            db.session.commit()
-
-        return jsonify({
-            'db_write': 'SUCCESS' if found else 'FAILED',
-            'token_id': found.id if found else None,
-        }), 200
-
-    except Exception:
-        db.session.rollback()
-        return jsonify({
-            'db_write': 'EXCEPTION',
-            'error': traceback.format_exc()[-500:]
-        }), 500
