@@ -1,3 +1,9 @@
+<<<<<<< HEAD
+=======
+"""
+Auth Routes - Fixed unique constraint on otp_tokens
+"""
+>>>>>>> f88490e8 (Fix password reset - use raw SQL to avoid constraint error)
 from flask import Blueprint, request, jsonify, current_app
 from flask_jwt_extended import (
     create_access_token, create_refresh_token,
